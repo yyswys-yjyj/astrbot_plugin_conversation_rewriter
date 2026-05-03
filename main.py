@@ -50,7 +50,6 @@ class ConversationRewriter(Star):
         umo = event.unified_msg_origin
         conv_mgr = self.context.conversation_manager
 
-        # 获取当前对话ID（缩小try范围，仅捕获数据库层潜在异常）
         try:
             curr_cid = await conv_mgr.get_curr_conversation_id(umo)
         except Exception:
@@ -61,7 +60,6 @@ class ConversationRewriter(Star):
             yield event.plain_result("[FAIL] 无法获取当前对话 ID")
             return
 
-        # 获取对话对象
         try:
             conversation = await conv_mgr.get_conversation(umo, curr_cid)
         except Exception:
@@ -112,7 +110,7 @@ class ConversationRewriter(Star):
         temp_history = [msg for i, msg in enumerate(history) if i < delete_start or i > delete_end]
         temp_history.append(new_user_msg)
 
-        # 4. 加载人格 system_prompt（使用具体异常记录，但不中断流程）
+        # 4. 加载人格 system_prompt
         system_prompt = ""
         try:
             conv_mgr = self.context.conversation_manager
@@ -132,7 +130,6 @@ class ConversationRewriter(Star):
                     logger.info("[rewrite] 使用默认人格")
         except Exception:
             logger.error(f"加载人格失败: {traceback.format_exc()}")
-            # 人格加载失败不影响核心功能，只是缺少人设，继续运行
 
         # 5. 构建 LLM 上下文
         contexts = []
@@ -140,7 +137,7 @@ class ConversationRewriter(Star):
             contexts.append(SystemMessageSegment(content=[TextPart(text=system_prompt)]))
         contexts.extend(self._history_to_message_segments(temp_history))
 
-        # 6. 调用 LLM（区分超时和其他错误）
+        # 6. 调用 LLM
         try:
             prov_id = await self.context.get_current_chat_provider_id(umo)
             llm_resp = await self.context.llm_generate(
@@ -167,13 +164,15 @@ class ConversationRewriter(Star):
             logger.error(f"并发检查失败: {traceback.format_exc()}")
             extra_msgs = []
 
-        # 8. 安全修改历史
+        # 8. 安全修改历史（重要：先删除旧区间，再追加本次重写的新对话，最后追加并发消息）
         self._remove_range(history, delete_start, delete_end)
-        if extra_msgs:
-            history.extend(extra_msgs)
-            logger.info(f"[rewrite] 追加了 {len(extra_msgs)} 条并发消息")
+        # 先添加本次重写产生的新用户消息和 AI 回复
         history.append(new_user_msg)
         history.append({"role": "assistant", "content": [{"type": "text", "text": assistant_text}]})
+        # 再追加 LLM 期间并发的新消息（它们应该发生在本次重写之后）
+        if extra_msgs:
+            history.extend(extra_msgs)
+            logger.info(f"[rewrite] 追加了 {len(extra_msgs)} 条并发消息（已保证时间顺序）")
 
         # 9. 持久化
         try:
@@ -216,7 +215,7 @@ class ConversationRewriter(Star):
         )
         yield event.plain_result(msg)
 
-    # ---------- 工具函数 ----------
+    # ---------- 工具函数（保持不变） ----------
     @staticmethod
     def _split_content(content) -> Tuple[str, List[dict]]:
         if isinstance(content, str):
