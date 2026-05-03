@@ -2,7 +2,7 @@ import json
 import re
 import asyncio
 import traceback
-from typing import Dict, Optional, List, Tuple
+from typing import Optional, List, Tuple
 
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star
@@ -17,7 +17,7 @@ from astrbot.core.agent.message import (
 
 
 class ConversationRewriter(Star):
-    def __init__(self, context: Context, config: dict = None):
+    def __init__(self, context: Context, config: Optional[dict] = None):
         super().__init__(context)
         self.config = config or {}
         logger.info("会话修改插件已加载")
@@ -49,20 +49,23 @@ class ConversationRewriter(Star):
 
         umo = event.unified_msg_origin
         conv_mgr = self.context.conversation_manager
+
+        # 获取当前对话ID（缩小try范围，仅捕获数据库层潜在异常）
         try:
             curr_cid = await conv_mgr.get_curr_conversation_id(umo)
         except Exception:
-            logger.error(traceback.format_exc())
+            logger.error(f"获取对话ID失败: {traceback.format_exc()}")
             yield event.plain_result("[FAIL] 获取对话 ID 失败")
             return
         if not curr_cid:
             yield event.plain_result("[FAIL] 无法获取当前对话 ID")
             return
 
+        # 获取对话对象
         try:
             conversation = await conv_mgr.get_conversation(umo, curr_cid)
         except Exception:
-            logger.error(traceback.format_exc())
+            logger.error(f"获取对话对象失败: {traceback.format_exc()}")
             yield event.plain_result("[FAIL] 获取对话对象失败")
             return
         if not conversation or not conversation.history:
@@ -101,44 +104,43 @@ class ConversationRewriter(Star):
         new_content = system_items + [{"type": "text", "text": new_user_text}]
         new_user_msg = {"role": "user", "content": new_content}
 
-        # 3. 构造临时上下文（删除旧对话对 + 新用户消息）
+        # 3. 确定删除区间（确保 end >= start）
         last_ai_idx, _ = self._find_last_by_role(history, "assistant")
         delete_start = last_user_idx
-        delete_end = last_ai_idx if last_ai_idx != -1 else last_user_idx
+        delete_end = max(last_ai_idx, last_user_idx)
+
         temp_history = [msg for i, msg in enumerate(history) if i < delete_start or i > delete_end]
         temp_history.append(new_user_msg)
 
-        # 4. 获取人格 system_prompt
+        # 4. 加载人格 system_prompt（使用具体异常记录，但不中断流程）
         system_prompt = ""
         try:
-            # 获取当前会话绑定的人格 ID
             conv_mgr = self.context.conversation_manager
             conversation = await conv_mgr.get_conversation(umo, curr_cid)
             persona_id = conversation.persona_id if conversation else None
             if persona_id:
-                # 同步获取
                 persona = self.context.persona_manager.get_persona(persona_id)
                 if persona:
                     system_prompt = persona.system_prompt
-                    logger.info(f"[rewrite] 已加载人格: {persona_id}, prompt 长度: {len(system_prompt)}")
+                    logger.info(f"[rewrite] 已加载人格: {persona_id}, 长度: {len(system_prompt)}")
                 else:
                     logger.warning(f"[rewrite] 人格未找到: {persona_id}")
             else:
-                # 没有绑定人格，尝试获取默认人格（需要 await）
                 default_persona = await self.context.persona_manager.get_default_persona_v3(umo)
                 if default_persona and "prompt" in default_persona:
                     system_prompt = default_persona["prompt"]
                     logger.info("[rewrite] 使用默认人格")
-        except Exception as e:
+        except Exception:
             logger.error(f"加载人格失败: {traceback.format_exc()}")
+            # 人格加载失败不影响核心功能，只是缺少人设，继续运行
 
-        # 5. 构建 LLM 上下文（将 system_prompt 放在最前面）
+        # 5. 构建 LLM 上下文
         contexts = []
         if system_prompt:
             contexts.append(SystemMessageSegment(content=[TextPart(text=system_prompt)]))
         contexts.extend(self._history_to_message_segments(temp_history))
 
-        # 6. 调用 LLM
+        # 6. 调用 LLM（区分超时和其他错误）
         try:
             prov_id = await self.context.get_current_chat_provider_id(umo)
             llm_resp = await self.context.llm_generate(
@@ -150,23 +152,26 @@ class ConversationRewriter(Star):
             logger.error("LLM 调用超时")
             return event.plain_result("[FAIL] 调用 LLM 超时，历史未修改")
         except Exception:
-            logger.error(traceback.format_exc())
+            logger.error(f"LLM 调用失败: {traceback.format_exc()}")
             return event.plain_result("[FAIL] 调用 LLM 失败，历史未修改")
 
-        # 7. 合并并发新消息
+        # 7. 处理并发新消息
         try:
             fresh_conv = await self.context.conversation_manager.get_conversation(umo, curr_cid)
             if fresh_conv and fresh_conv.history:
                 fresh_history = self._load_history(fresh_conv.history)
-                original_len = len(history)
-                if len(fresh_history) > original_len:
-                    history.extend(fresh_history[original_len:])
-                    logger.info("[rewrite] 检测到并发新消息，已合并")
+                extra_msgs = fresh_history[len(history):] if len(fresh_history) > len(history) else []
+            else:
+                extra_msgs = []
         except Exception:
-            logger.error(traceback.format_exc())
+            logger.error(f"并发检查失败: {traceback.format_exc()}")
+            extra_msgs = []
 
-        # 8. 删除旧区间，添加新 user + assistant
+        # 8. 安全修改历史
         self._remove_range(history, delete_start, delete_end)
+        if extra_msgs:
+            history.extend(extra_msgs)
+            logger.info(f"[rewrite] 追加了 {len(extra_msgs)} 条并发消息")
         history.append(new_user_msg)
         history.append({"role": "assistant", "content": [{"type": "text", "text": assistant_text}]})
 
@@ -175,7 +180,7 @@ class ConversationRewriter(Star):
             await self.context.conversation_manager.update_conversation(umo, curr_cid, history=history)
             logger.info("[rewrite] 新对话对已保存")
         except Exception:
-            logger.error(traceback.format_exc())
+            logger.error(f"保存对话失败: {traceback.format_exc()}")
             return event.plain_result("[FAIL] 修改成功但保存失败")
 
         return event.chain_result([Plain(assistant_text)])
@@ -191,11 +196,12 @@ class ConversationRewriter(Star):
             return event.plain_result("[FAIL] 匹配到多处相同的文本，请提供更多特征文本以避免歧义")
         new_ai_text = ai_text.replace(old, new, 1)
         last_ai["content"] = [{"type": "text", "text": new_ai_text}]
+
         try:
             await self.context.conversation_manager.update_conversation(umo, curr_cid, history=history)
             logger.info("[rewrite] AI 记忆已更新")
         except Exception:
-            logger.error(traceback.format_exc())
+            logger.error(f"保存 AI 记忆失败: {traceback.format_exc()}")
             return event.plain_result("[FAIL] 保存失败")
         return event.plain_result("[OK] AI 记忆已修正，下次对话将基于新记忆")
 
@@ -233,28 +239,18 @@ class ConversationRewriter(Star):
     @staticmethod
     def _parse_args(raw: str) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
         raw = re.sub(r'\s*\[MSG_ID:\d+\]$', '', raw).strip()
-        if raw.startswith("/rewrite"):
-            raw = raw[len("/rewrite"):].strip()
-        elif raw.startswith("rewrite"):
-            raw = raw[len("rewrite"):].strip()
-        else:
-            return None, None, None, "指令格式错误"
-        if not raw:
-            return None, None, None, "缺少参数"
-        parts = raw.split(maxsplit=1)
-        target = parts[0].lower()
-        if target not in ("user", "ai"):
-            return None, None, None, f"目标角色必须是 'user' 或 'ai'"
-        if len(parts) == 1:
-            return None, None, None, "缺少旧文本和新文本"
+        match = re.match(r'^[^\w]?rewrite\s+(user|ai)\s+(.*)', raw, re.IGNORECASE)
+        if not match:
+            return None, None, None, "指令格式错误，应为 rewrite user/ai <旧文本> <新文本>"
+        target = match.group(1).lower()
+        args_str = match.group(2).strip()
 
-        args_str = parts[1].strip()
         delim_pairs = [('"', '"'), ("'", "'"), ('(', ')'), ('\u201c', '\u201d'), ('\u2018', '\u2019')]
         for start, end in delim_pairs:
             if args_str.startswith(start):
                 end_idx = args_str.find(end, 1)
                 if end_idx == -1:
-                    return None, None, None, "未找到匹配的结束符号"
+                    return None, None, None, f"未找到匹配的结束符号: {repr(end)}"
                 old = args_str[1:end_idx]
                 remaining = args_str[end_idx + 1:].strip()
                 if not remaining.startswith(start):
@@ -279,12 +275,17 @@ class ConversationRewriter(Star):
         if isinstance(history_raw, str):
             try:
                 data = json.loads(history_raw)
-                if isinstance(data, str):
+            except json.JSONDecodeError:
+                logger.error("历史记录 JSON 解析失败")
+                return []
+            if isinstance(data, str):
+                try:
                     data = json.loads(data)
-                if isinstance(data, list):
-                    return list(data)
-            except Exception:
-                pass
+                except json.JSONDecodeError:
+                    logger.error("二次 JSON 解析失败")
+                    return []
+            if isinstance(data, list):
+                return list(data)
         return []
 
     @staticmethod
@@ -299,6 +300,8 @@ class ConversationRewriter(Star):
     def _remove_range(history: List[dict], start: int, end: int):
         if 0 <= start <= end < len(history):
             del history[start:end + 1]
+        else:
+            logger.warning(f"_remove_range 索引无效: start={start}, end={end}, len={len(history)}")
 
     @staticmethod
     def _history_to_message_segments(history: List[dict]) -> List:
@@ -308,10 +311,16 @@ class ConversationRewriter(Star):
             if isinstance(content, str):
                 text = content
             elif isinstance(content, list):
-                text = "".join(
-                    item.get("text", "") for item in content
-                    if isinstance(item, dict) and item.get("type") == "text"
-                )
+                text_parts = []
+                non_text_count = 0
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        text_parts.append(item.get("text", ""))
+                    else:
+                        non_text_count += 1
+                if non_text_count > 0:
+                    logger.warning(f"消息包含 {non_text_count} 个非文本组件，将被丢弃")
+                text = "".join(text_parts)
             else:
                 text = str(content)
 
