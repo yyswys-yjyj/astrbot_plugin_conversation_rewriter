@@ -1,0 +1,7 @@
+{
+  "allow_modify_assistant": {
+    "description": "是否允许修改 AI（assistant）的回复记忆",
+    "type": "bool",
+    "default": true
+  }
+}
